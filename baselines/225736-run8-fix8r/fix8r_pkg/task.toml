@@ -1,0 +1,24 @@
+schema_version = "1.3"
+
+[task]
+name = "cpoct-hlo/oms-order-lock-deadlock"
+description = "Eliminate gap/next-key and cross-service lock-order deadlocks in a Spring Boot + MyBatis order management system on MySQL 8 without changing isolation level or schema"
+authors = []
+keywords = ["mysql", "innodb", "deadlock", "gap-lock", "spring-boot", "mybatis", "java", "debugging"]
+
+[metadata]
+difficulty = "hard"
+category = "database-debugging"
+tags = ["mysql", "innodb", "deadlock", "next-key-lock", "lock-ordering", "microservices", "spring-boot", "mybatis", "java"]
+
+[agent]
+timeout_sec = 3600.0
+
+[verifier]
+timeout_sec = 1200.0
+
+[environment]
+build_timeout_sec = 900.0
+cpus = 4
+memory_mb = 8192
+storage_mb = 10240

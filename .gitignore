@@ -1,0 +1,15 @@
+*.b64
+*.webp
+.env
+**/ta-profile/
+**/chrome-profile/
+**/ds-profile/
+status/
+ide/
+v2/
+v3/
+v2_local/
+db/
+__pycache__/
+*.pyc
+.DS_Store

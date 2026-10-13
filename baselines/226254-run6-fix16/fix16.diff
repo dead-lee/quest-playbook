@@ -1,0 +1,270 @@
+diff -ruN fix15_pkg/tests/harness.py fix16_pkg/tests/harness.py
+--- fix15_pkg/tests/harness.py	2026-10-12 23:52:53.403997198 +0800
++++ fix16_pkg/tests/harness.py	2026-10-13 11:32:32.924822159 +0800
+@@ -4,7 +4,10 @@
+ import atexit
+ import os
+ import random
++import shutil
+ import subprocess
++import sys
++import tempfile
+ import time
+ import urllib.request
+ 
+@@ -150,3 +153,54 @@
+     except BaseException:
+         stop_all()
+         raise
++
++
++def build_app(app, jars, log):
++    """Build the candidate project offline as the unprivileged RUN_AS user, in a private copy of
++    /app and a private HOME + Maven repository copy that this user owns. The build gets a clean
++    environment (no TESTS_DIR/OMS_RUN), cannot read the root-private verifier copy and cannot
++    write /logs/verifier. Only the two regular-file jars are copied out. Returns 0 on success."""
++    build = tempfile.mkdtemp(prefix="oms-build-")
++    home = tempfile.mkdtemp(prefix="oms-home-")
++    try:
++        shutil.copytree(app, build, symlinks=True, dirs_exist_ok=True)
++        for d in os.listdir(build):
++            shutil.rmtree(os.path.join(build, d, "target"), ignore_errors=True)
++        repo = os.path.join(home, "repository")
++        shutil.copytree(os.environ.get("M2_REPO", os.path.expanduser("~/.m2/repository")), repo, symlinks=True)
++        if RUN_AS:
++            subprocess.run(["chown", "-R", RUN_AS, build, home], check=True)
++        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": home, "LANG": "C.UTF-8"}
++        if os.environ.get("JAVA_HOME"):
++            env["JAVA_HOME"] = os.environ["JAVA_HOME"]
++        runner = ["runuser", "-u", RUN_AS, "--"] if RUN_AS else []
++        cmd = runner + [shutil.which("mvn") or "mvn", "-o", "-q", "-B", "-Dmaven.repo.local=" + repo,
++                        "package", "-DskipTests"]
++        with open(log, "w") as lg:
++            try:
++                rc = subprocess.run(cmd, cwd=build, env=env, stdout=lg, stderr=subprocess.STDOUT,
++                                    timeout=900).returncode
++            except subprocess.TimeoutExpired:
++                rc = 124
++        if rc != 0:
++            return 1
++        os.makedirs(jars, exist_ok=True)
++        for s in ("order", "item"):
++            src = os.path.join(build, s + "-service", "target", s + "-service.jar")
++            if os.path.islink(src) or not os.path.isfile(src):
++                return 1
++            dst = os.path.join(jars, s + "-service.jar")
++            shutil.copyfile(src, dst)
++            os.chmod(dst, 0o644)
++        os.chmod(jars, 0o755)
++        return 0
++    except Exception as e:
++        print("build error:", repr(e))
++        return 1
++    finally:
++        shutil.rmtree(build, ignore_errors=True)
++        shutil.rmtree(home, ignore_errors=True)
++
++
++if __name__ == "__main__" and sys.argv[1:2] == ["build"]:
++    sys.exit(build_app(*sys.argv[2:5]))
+diff -ruN fix15_pkg/tests/test.sh fix16_pkg/tests/test.sh
+--- fix15_pkg/tests/test.sh	2026-10-13 08:57:06.880657997 +0800
++++ fix16_pkg/tests/test.sh	2026-10-13 11:32:56.320822159 +0800
+@@ -9,12 +9,15 @@
+ #   server's INNODB_METRICS counters, consistency is recomputed from the database itself.
+ REWARD_FILE="/logs/verifier/reward.txt"
+ mkdir -p /logs/verifier
++chmod 755 /logs/verifier 2>/dev/null || true
+ echo "0" > "$REWARD_FILE"
++# Every early exit writes 0 itself (never echoes a file the candidate could have touched).
++fail0() { echo "$1"; echo "0" > "$REWARD_FILE"; echo "0"; exit 0; }
+ TESTS_SRC="$(cd "$(dirname "$0")" && pwd)"
+ OMS_RUN="${OMS_RUN:-/tmp/oms-verify}"
+ export RUN_AS="${RUN_AS-nobody}"
+ rm -rf "$OMS_RUN"; mkdir -p "$OMS_RUN"
+-trap 'rm -rf "${WORK:-}" "${BUILD:-}"' EXIT
++trap 'rm -rf "${WORK:-}"' EXIT
+ 
+ # Copy the verifier to a root-private dir BEFORE building anything and record a sha256 manifest
+ # (kept in a shell variable only); the candidate build never sees TESTS_DIR/OMS_RUN.
+@@ -24,24 +27,22 @@
+ MANIFEST="$(cd "$WORK" && find . -type f -print0 | sort -z | xargs -0 sha256sum)"
+ verify_tests() { ( cd "$WORK" && printf '%s\n' "$MANIFEST" | sha256sum -c --quiet --strict - ) >/dev/null 2>&1; }
+ 
+-BUILD="$(mktemp -d)"
+-cp -r "${APP_DIR:-/app}/." "$BUILD/"
+-rm -rf "$BUILD"/*/target
+-( cd "$BUILD" && env -u TESTS_DIR -u OMS_RUN -u TESTS_SRC -u WORK -u MANIFEST mvn -o -q -B package -DskipTests ) > "$OMS_RUN/build.log" 2>&1 || { echo "build failed"; tail -30 "$OMS_RUN/build.log"; cat "$REWARD_FILE"; exit 0; }
+-JARS="$OMS_RUN/jars"; mkdir -p "$JARS"
+-cp "$BUILD"/order-service/target/order-service.jar "$BUILD"/item-service/target/item-service.jar "$JARS"/ || { cat "$REWARD_FILE"; exit 0; }
+-chmod -R a+rX "$JARS"
++# The candidate build runs as the unprivileged user (harness.build_app): private copy of /app and
++# of the Maven repo, temp HOME, clean env; it cannot read $WORK or write /logs/verifier.
++JARS="$OMS_RUN/jars"
++env -u TESTS_DIR -u OMS_RUN -u TESTS_SRC -u WORK -u MANIFEST python3 "$WORK/harness.py" build "${APP_DIR:-/app}" "$JARS" "$OMS_RUN/build.log" \
++    || { tail -30 "$OMS_RUN/build.log"; fail0 "build failed or jars missing"; }
+ 
+ # Run from the private copy made above (root-owned when run as root); nothing is read from
+ # /opt/oms or the candidate tree except the app sources built above.
+-verify_tests || { echo "verifier tests modified during build"; cat "$REWARD_FILE"; exit 0; }
++verify_tests || fail0 "verifier tests modified during build"
+ export OMS_RUN
+ export TESTS_DIR="$WORK"
+ cd "$WORK"
+ OMS_SOCK="$OMS_RUN/mysql.sock" OMS_JARS="$JARS" timeout 1080 python3 -m pytest -q -s -p no:cacheprovider \
+     --junitxml="$WORK/junit.xml" test_outputs.py
+ echo "deadlock reports logged by services: $(grep -c LOCK_CONFLICT "$OMS_RUN"/svclog/*.log 2>/dev/null | tr '\n' ' ')"
+-verify_tests || { echo "verifier tests modified during run"; cat "$REWARD_FILE"; exit 0; }
++verify_tests || fail0 "verifier tests modified during run"
+ python3 - "$WORK/junit.xml" <<'PY'
+ import sys
+ import xml.etree.ElementTree as ET
+@@ -65,6 +66,5 @@
+ open("/logs/verifier/reward.txt", "w").write(f"{score:.4f}\n")
+ print("reward", round(score, 4))
+ PY
+-cat "$REWARD_FILE"
+-rm -rf "$WORK" "$BUILD"
++rm -rf "$WORK"
+ exit 0
+diff -ruN fix15_pkg/tests/test_outputs.py fix16_pkg/tests/test_outputs.py
+--- fix15_pkg/tests/test_outputs.py	2026-10-12 23:52:51.119997198 +0800
++++ fix16_pkg/tests/test_outputs.py	2026-10-13 11:33:03.520822159 +0800
+@@ -47,6 +47,9 @@
+                 failures.append(f"{r['lock_timeouts']} lock wait timeouts (MySQL error 1205)")
+             if r["isolation"] and r["isolation"] != ["REPEATABLE-READ"]:
+                 failures.append(f"service sessions use isolation {r['isolation']}")
++            if r["secs"] > r["max_secs"] or r["late"]:
++                failures.append(f"phase took {r['secs']}s, {r['late']} requests not finished within "
++                                f"the {r['max_secs']}s limit")
+             if r["peak_trx"] < 4:
+                 failures.append(f"only {r['peak_trx']} concurrent transactions observed (work is serialized)")
+             failures += w.check_consistency(SOCK, init, ops)[:5]
+diff -ruN fix15_pkg/tests/workload.py fix16_pkg/tests/workload.py
+--- fix15_pkg/tests/workload.py	2026-10-12 23:52:49.675997198 +0800
++++ fix16_pkg/tests/workload.py	2026-10-13 11:33:03.516822159 +0800
+@@ -131,7 +131,7 @@
+     peak = [0]
+     iso = set()
+     stop = threading.Event()
+-    deadline = time.time() + max_secs
++    deadline = time.monotonic() + max_secs
+ 
+     def sampler():
+         c = db(sock)
+@@ -152,10 +152,12 @@
+                 op = next(it, None)
+             if op is None:
+                 return
+-            if time.time() > deadline:
++            if time.monotonic() > deadline:
+                 op.status = 598  # not executed: phase ran out of time
+                 continue
+             op.run()
++            if op.t_recv > deadline:
++                op.late = True   # started in time but finished after the phase limit -> failure
+ 
+     st = threading.Thread(target=sampler)
+     st.start()
+@@ -175,6 +177,8 @@
+         "peak_trx": peak[0],
+         "isolation": sorted(iso),
+         "secs": round(time.time() - t0, 1),
++        "late": sum(1 for op in ops if getattr(op, "late", False) or op.status == 598),
++        "max_secs": max_secs,
+     }
+ 
+ 
+@@ -299,11 +303,8 @@
+                 else:
+                     assert b["status"] == "OPEN" and b["itemCount"] == len(op.lines) \
+                         and b["confirmedCount"] == 0, f"edit body {b}"
+-                    lo = sum(Decimal(l["qty"]) * iinv[l["productId"]]["unit_price"] for l in op.lines)
+-                    hi = lo + sum(Decimal(l["qty"]) * price_delta[l["productId"]] for l in op.lines)
+-                    assert lo <= tot <= hi, f"edit total {tot} outside [{lo}, {hi}]"
+-                    if not any(price_delta.values()):
+-                        assert tot == lo, f"edit total {tot} != {lo}"
++                    exp = _edit_totals(op, ops, iinv)
++                    assert tot in exp, f"edit total {tot} not in exact commit-time values {sorted(exp)[:6]}"
+             elif op.kind == "confirm":
+                 assert set(b) >= {"total", "itemCount", "confirmedCount"}, f"fields {sorted(b)}"
+                 tot = _amount(b["total"])
+@@ -313,12 +314,77 @@
+                         f"confirm body {b}"
+             else:
+                 n = b.get("orders")
+-                assert isinstance(n, int) and not isinstance(n, bool) and 0 <= n <= len(orders), f"reprice body {b}"
++                lo, hi = _reprice_counts(op, ops, init)
++                assert isinstance(n, int) and not isinstance(n, bool) and lo <= n <= hi, \
++                    f"reprice body {b}: expected {lo}" + (f"..{hi} (overlapping writes)" if hi != lo else "")
+         except (AssertionError, ValueError, KeyError, TypeError) as e:
+             probs.append(f"{tag} response body wrong: {e}")
+     return probs
+ 
+ 
++def _overlaps(a, b):
++    """a and b ran concurrently (neither finished before the other was sent)."""
++    return not (a.t_recv < b.t_send or b.t_recv < a.t_send)
++
++
++def _edit_totals(op, ops, iinv):
++    """Exact totals an edit may return: qty x the price committed when the edit committed.
++    Reprices finished before the edit was sent are included, reprices sent after it finished
++    are not; only reprices that overlapped the edit may fall on either side of its commit."""
++    base = sum((Decimal(l["qty"]) * iinv[l["productId"]]["unit_price"] for l in op.lines), Decimal("0"))
++    def part(r):
++        a, b, d = r.rng
++        return sum((Decimal(l["qty"]) * d for l in op.lines if a <= l["productId"] <= b), Decimal("0"))
++    vals = {base}
++    for r in ops:
++        if r.kind != "reprice" or r.status != 200 or r.t_send is None:
++            continue
++        c = part(r)
++        if not c:
++            continue
++        if r.t_recv < op.t_send:
++            vals = {v + c for v in vals}
++        elif _overlaps(r, op):
++            vals |= {v + c for v in vals}
++    return vals
++
++
++def _reprice_counts(rp, ops, init):
++    """Exact number of non-cancelled orders with a line in [a, b] at the reprice's commit.
++    Per order, the state at commit is the state after its last committed edit/cancel; an
++    edit/cancel finished before the reprice was sent is settled, one overlapping it may land on
++    either side. Returns (min, max); min == max whenever no write on the range overlapped."""
++    io, ii, iinv = init
++    a, b = rp.rng[0], rp.rng[1]
++    hit = lambda prods: any(a <= p <= b for p in prods)
++    init_prods = defaultdict(list)
++    for it in ii:
++        init_prods[it["order_id"]].append(it["product_id"])
++    writes = defaultdict(list)
++    for op in ops:
++        if op.kind in ("edit", "cancel") and op.status == 200 and op.t_send is not None:
++            writes[op.order].append(op)
++    lo = hi = 0
++    for oid, o in io.items():
++        if o["status"] == "CANCELLED":
++            continue
++        cand = []
++        ws = [w for w in writes.get(oid, []) if w.t_send < rp.t_recv]
++        settled = [w for w in ws if w.t_recv < rp.t_send]
++        # candidates for "last write committed before the reprice": not definitely followed by
++        # another settled write
++        for w in ws:
++            if not any(w.t_recv < y.t_send and y.t_recv < rp.t_send for y in settled if y is not w):
++                cand.append(False if w.kind == "cancel" else hit([l["productId"] for l in w.lines]))
++        if not settled:
++            cand.append(hit(init_prods[oid]))
++        if any(w.kind == "cancel" for w in settled):
++            cand = [False]
++        lo += all(cand)
++        hi += any(cand)
++    return lo, hi
++
++
+ def check_status_timeline(ops, orders):
+     """409 semantics judged on the request timeline, not on the final state.
+     Let C be the (single) cancel of order X that returned 200, [C.send, C.recv] its interval.
