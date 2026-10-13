@@ -1,0 +1,60 @@
+diff -ru fix8r_pkg/instruction.md fix15_pkg/instruction.md
+--- fix8r_pkg/instruction.md	2026-10-12 23:52:51.171997198 +0800
++++ fix15_pkg/instruction.md	2026-10-13 08:57:06.892657997 +0800
+@@ -43,7 +43,7 @@
+ 2. 并发压测期间，MySQL 服务端 `information_schema.INNODB_METRICS` 里的 `lock_deadlocks` 和 `lock_timeouts` 计数都不能增加。计数取自数据库服务端，重试成功也算一次死锁，所以靠重试、加大重试次数或吞掉异常都没用。
+ 3. 压测结束后数据一致（金额一律按分精确比较，不允许任何误差，任何一项对不上该轮即失败）：每个未取消订单的 `total_amount` 等于其明细 `qty × unit_price` 之和，`item_count`、`confirmed_count` 与明细一致；已取消订单没有明细、金额为 0；每个商品的 `reserved` 等于全部明细中该商品数量之和，`stock` 不变；每个商品的单价等于初始单价加上所有成功调价的 delta；每条明细的 `unit_price` 都等于该商品当前的 `inventory.unit_price`（改单按当时的最新单价写入明细，调价必须覆盖调价提交时所有含该商品的明细，包括并发改单刚写入的）；每个未取消订单的明细恰好是某一次成功改单提交的内容（没改过的保持初始明细）。并发压测中每个响应体也按上面的字段契约逐项校验（金额必须是精确到分的数字，409 的 body 必须是 `{"error": ..., "mysqlError": 0}`）。
+ 4. 请求要真正并发处理：不能用全局锁、单连接池、`LOCK TABLES`、`GET_LOCK` 之类把所有请求串行化。压测期间会定时采样 `performance_schema.data_locks`，统计 `oms_app` 账号下同一时刻持有或等待 `orders`/`order_items`/`inventory` 行锁的不同事务数（只开着事务、不碰这些表的空闲事务不计），峰值低于 4 即判为“被串行化”，该轮不通过。
+-5. 压测的输入范围：商品 ID 为 1–20。初始数据每次测试随机生成：100–140 个未取消订单（ID 从 1 连续编号），每单 3 行不同商品的明细，数量 1–5；单价 5.00–40.00（步长 0.05），库存 50000–150000，`reserved` 等于初始明细数量之和，客户 ID 1000–9999，初始均为 `PENDING`、`confirmed_count = 0`。每轮约 400 个请求、50 个并发客户端，集中打在 10–30 个 ID 相邻的订单上。改单每次 2–4 个不同商品、每个数量 1–5；调价区间 `toProductId - fromProductId` 为 1–3，delta 为 0.01–0.50；同一订单可能被反复改单、确认，也会在被取消之后继续收到改单请求（应返回 409），而它相邻订单上的请求必须照常成功。
++5. 压测的输入范围：商品 ID 为 1–20。初始数据每次测试随机生成：100–140 个未取消订单（ID 从 1 连续编号），每单 3 行不同商品的明细，数量 1–5；单价 5.00–40.00（步长 0.05），库存 50000–150000，`reserved` 等于初始明细数量之和，客户 ID 1000–9999，初始均为 `PENDING`、`confirmed_count = 0`。每轮约 400 个请求、50 个并发客户端，集中打在 10–30 个 ID 相邻的订单上。改单每次 2–4 个不同商品、每个数量 1–5；调价区间 `toProductId - fromProductId` 为 1–3，delta 为 0.01–0.50；同一订单可能被反复改单、确认，也会在被取消之后继续收到改单请求（应返回 409），而它相邻订单上的请求必须照常成功。每个并发阶段必须在 45 秒内跑完，超出这个时间还没执行完的请求一律算失败。
+ 6. 不许改隔离级别（包括在连接串或会话里改），不许改表结构、主键和索引，测试时会用自己的配置和数据重新初始化数据库，服务只拿到 `oms_app` 账号的增删改查权限。保留两个服务的拆分、端口和上面的对外接口。
+ 
+ ## 提示
+diff -ru fix8r_pkg/tests/test.sh fix15_pkg/tests/test.sh
+--- fix8r_pkg/tests/test.sh	2026-10-13 06:40:58.703985957 +0800
++++ fix15_pkg/tests/test.sh	2026-10-13 08:57:06.880657997 +0800
+@@ -10,29 +10,38 @@
+ REWARD_FILE="/logs/verifier/reward.txt"
+ mkdir -p /logs/verifier
+ echo "0" > "$REWARD_FILE"
+-export TESTS_DIR="$(cd "$(dirname "$0")" && pwd)"
+-export OMS_RUN="${OMS_RUN:-/tmp/oms-verify}"
++TESTS_SRC="$(cd "$(dirname "$0")" && pwd)"
++OMS_RUN="${OMS_RUN:-/tmp/oms-verify}"
+ export RUN_AS="${RUN_AS-nobody}"
+ rm -rf "$OMS_RUN"; mkdir -p "$OMS_RUN"
+ trap 'rm -rf "${WORK:-}" "${BUILD:-}"' EXIT
+ 
++# Copy the verifier to a root-private dir BEFORE building anything and record a sha256 manifest
++# (kept in a shell variable only); the candidate build never sees TESTS_DIR/OMS_RUN.
++WORK="$(mktemp -d)"; chmod 700 "$WORK"
++cp -r "$TESTS_SRC/." "$WORK/"
++chmod -R a-w "$WORK"; chmod u+w "$WORK"
++MANIFEST="$(cd "$WORK" && find . -type f -print0 | sort -z | xargs -0 sha256sum)"
++verify_tests() { ( cd "$WORK" && printf '%s\n' "$MANIFEST" | sha256sum -c --quiet --strict - ) >/dev/null 2>&1; }
++
+ BUILD="$(mktemp -d)"
+ cp -r "${APP_DIR:-/app}/." "$BUILD/"
+ rm -rf "$BUILD"/*/target
+-( cd "$BUILD" && mvn -o -q -B package -DskipTests ) > "$OMS_RUN/build.log" 2>&1 || { echo "build failed"; tail -30 "$OMS_RUN/build.log"; cat "$REWARD_FILE"; exit 0; }
++( cd "$BUILD" && env -u TESTS_DIR -u OMS_RUN -u TESTS_SRC -u WORK -u MANIFEST mvn -o -q -B package -DskipTests ) > "$OMS_RUN/build.log" 2>&1 || { echo "build failed"; tail -30 "$OMS_RUN/build.log"; cat "$REWARD_FILE"; exit 0; }
+ JARS="$OMS_RUN/jars"; mkdir -p "$JARS"
+ cp "$BUILD"/order-service/target/order-service.jar "$BUILD"/item-service/target/item-service.jar "$JARS"/ || { cat "$REWARD_FILE"; exit 0; }
+ chmod -R a+rX "$JARS"
+ 
+-# Run from a private copy of the verifier (root-owned when run as root); nothing is read from
++# Run from the private copy made above (root-owned when run as root); nothing is read from
+ # /opt/oms or the candidate tree except the app sources built above.
+-WORK="$(mktemp -d)"; chmod 700 "$WORK"
+-cp -r "$TESTS_DIR/." "$WORK/"
++verify_tests || { echo "verifier tests modified during build"; cat "$REWARD_FILE"; exit 0; }
++export OMS_RUN
+ export TESTS_DIR="$WORK"
+ cd "$WORK"
+ OMS_SOCK="$OMS_RUN/mysql.sock" OMS_JARS="$JARS" timeout 1080 python3 -m pytest -q -s -p no:cacheprovider \
+     --junitxml="$WORK/junit.xml" test_outputs.py
+ echo "deadlock reports logged by services: $(grep -c LOCK_CONFLICT "$OMS_RUN"/svclog/*.log 2>/dev/null | tr '\n' ' ')"
++verify_tests || { echo "verifier tests modified during run"; cat "$REWARD_FILE"; exit 0; }
+ python3 - "$WORK/junit.xml" <<'PY'
+ import sys
+ import xml.etree.ElementTree as ET

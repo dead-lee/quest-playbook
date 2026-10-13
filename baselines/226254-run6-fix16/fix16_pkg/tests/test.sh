@@ -1,0 +1,70 @@
+#!/bin/bash
+# Verifier for the OMS deadlock task.
+# - A fresh MySQL 8 instance is initialised from the verifier's own my.cnf (REPEATABLE READ,
+#   InnoDB defaults); schema, seed data, the DML-only service account and round setup/teardown
+#   come from tests/db, not from the candidate.
+# - The candidate project in /app is built offline and its two services run as the
+#   unprivileged user "nobody" (started by harness.py); they only reach MySQL through the oms_app account.
+# - Workloads are generated at verification time; deadlocks/lock timeouts are read from the
+#   server's INNODB_METRICS counters, consistency is recomputed from the database itself.
+REWARD_FILE="/logs/verifier/reward.txt"
+mkdir -p /logs/verifier
+chmod 755 /logs/verifier 2>/dev/null || true
+echo "0" > "$REWARD_FILE"
+# Every early exit writes 0 itself (never echoes a file the candidate could have touched).
+fail0() { echo "$1"; echo "0" > "$REWARD_FILE"; echo "0"; exit 0; }
+TESTS_SRC="$(cd "$(dirname "$0")" && pwd)"
+OMS_RUN="${OMS_RUN:-/tmp/oms-verify}"
+export RUN_AS="${RUN_AS-nobody}"
+rm -rf "$OMS_RUN"; mkdir -p "$OMS_RUN"
+trap 'rm -rf "${WORK:-}"' EXIT
+
+# Copy the verifier to a root-private dir BEFORE building anything and record a sha256 manifest
+# (kept in a shell variable only); the candidate build never sees TESTS_DIR/OMS_RUN.
+WORK="$(mktemp -d)"; chmod 700 "$WORK"
+cp -r "$TESTS_SRC/." "$WORK/"
+chmod -R a-w "$WORK"; chmod u+w "$WORK"
+MANIFEST="$(cd "$WORK" && find . -type f -print0 | sort -z | xargs -0 sha256sum)"
+verify_tests() { ( cd "$WORK" && printf '%s\n' "$MANIFEST" | sha256sum -c --quiet --strict - ) >/dev/null 2>&1; }
+
+# The candidate build runs as the unprivileged user (harness.build_app): private copy of /app and
+# of the Maven repo, temp HOME, clean env; it cannot read $WORK or write /logs/verifier.
+JARS="$OMS_RUN/jars"
+env -u TESTS_DIR -u OMS_RUN -u TESTS_SRC -u WORK -u MANIFEST python3 "$WORK/harness.py" build "${APP_DIR:-/app}" "$JARS" "$OMS_RUN/build.log" \
+    || { tail -30 "$OMS_RUN/build.log"; fail0 "build failed or jars missing"; }
+
+# Run from the private copy made above (root-owned when run as root); nothing is read from
+# /opt/oms or the candidate tree except the app sources built above.
+verify_tests || fail0 "verifier tests modified during build"
+export OMS_RUN
+export TESTS_DIR="$WORK"
+cd "$WORK"
+OMS_SOCK="$OMS_RUN/mysql.sock" OMS_JARS="$JARS" timeout 1080 python3 -m pytest -q -s -p no:cacheprovider \
+    --junitxml="$WORK/junit.xml" test_outputs.py
+echo "deadlock reports logged by services: $(grep -c LOCK_CONFLICT "$OMS_RUN"/svclog/*.log 2>/dev/null | tr '\n' ' ')"
+verify_tests || fail0 "verifier tests modified during run"
+python3 - "$WORK/junit.xml" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+# Gates (any failure -> 0): single-threaded business behaviour, schema/isolation unchanged.
+# Weighted concurrent phases (sum 1.0); each passes only with 0 deadlocks, 0 lock wait
+# timeouts, real concurrency, REPEATABLE READ sessions and fully consistent data.
+weights = {"test_concurrent_edit_and_confirm": 0.20, "test_concurrent_edit_and_cancel": 0.20,
+           "test_concurrent_reprice_and_edit": 0.20, "test_concurrent_after_cancel": 0.10,
+           "test_concurrent_mixed": 0.30}
+gates = ["test_single_thread_functional", "test_schema_and_isolation_unchanged",
+         "test_query_endpoints", "test_conflict_status_codes"]
+score = 0.0
+try:
+    root = ET.parse(sys.argv[1]).getroot()
+    passed = {tc.get("name") for tc in root.iter("testcase")
+              if not any(ch.tag in ("failure", "error", "skipped") for ch in tc)}
+    if all(g in passed for g in gates):
+        score = sum(wt for name, wt in weights.items() if name in passed)
+except Exception:
+    score = 0.0
+open("/logs/verifier/reward.txt", "w").write(f"{score:.4f}\n")
+print("reward", round(score, 4))
+PY
+rm -rf "$WORK"
+exit 0

@@ -1,0 +1,7 @@
+# Developer sandbox MySQL settings (the grader uses its own server config).
+[mysqld]
+port = 3306
+bind-address = 127.0.0.1
+innodb_lock_wait_timeout = 5
+innodb_print_all_deadlocks = ON
+skip-log-bin

@@ -1,0 +1,26 @@
+server:
+  port: ${ORDER_PORT:8081}
+  tomcat:
+    threads:
+      max: 300
+spring:
+  application:
+    name: order-service
+  datasource:
+    url: jdbc:mysql://${DB_HOST:127.0.0.1}:${DB_PORT:3306}/oms?useSSL=false&allowPublicKeyRetrieval=true
+    username: ${DB_USER:oms_app}
+    password: ${DB_PASSWORD:oms_app}
+    hikari:
+      maximum-pool-size: 150
+      connection-timeout: 30000
+mybatis:
+  configuration:
+    map-underscore-to-camel-case: true
+oms:
+  item-service:
+    url: http://127.0.0.1:${ITEM_PORT:8082}
+logging:
+  file:
+    name: ${OMS_LOG_DIR:/var/log/oms}/order-service.log
+  level:
+    oms.tx: INFO
